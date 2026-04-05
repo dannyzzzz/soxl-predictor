@@ -28,7 +28,7 @@ last_features_row = None
 
 def train_model():
     global model_dip, model_peak, last_features_row
-    print("🔄 מושך נתונים ומאמן מודלים...")
+    print("🔄 מושך נתונים ומאמן מודלים מתקדמים...")
     
     # 1. משיכת ה-CSV של SOXL מהגוגל שייטס
     response = requests.get(CSV_URL)
@@ -46,7 +46,6 @@ def train_model():
     df['Prev_Vol'] = (df['High'].shift(1) - df['Low'].shift(1)) / df['Open'].shift(1)
     df['VIX_Chg'] = df['VIX_Close'].pct_change()
     df['Oil_Chg'] = df['Oil_Close'].pct_change()
-    
     df['NVDA_Chg'] = df['NVDA_Close'].pct_change() 
     df['NVDA_Dist_MA20'] = (df['NVDA_Close'] - df['NVDA_Close'].rolling(20).mean()) / df['NVDA_Close'].rolling(20).mean()
 
@@ -76,7 +75,7 @@ def train_model():
     model_peak.fit(df[features], df['Target_Peak'])
     
     last_features_row = df[features].iloc[-1:].copy()
-    print("✅ המודלים אומנו בהצלחה!")
+    print("✅ המודלים אומנו בהצלחה עם NVDA! מחכה לסליידרים.")
 
 @app.route('/predict', methods=['GET'])
 def predict():
@@ -84,9 +83,11 @@ def predict():
         return jsonify({"error": "Model not trained yet"}), 500
     
     open_price = request.args.get('open_price', type=float)
-    # --- חידוש: קבלת רמת הסיכון מהסליידר (ברירת מחדל: 50, טווח: 1-100) ---
-    risk_level = request.args.get('risk_level', default=50, type=int)
-    # ---------------------------------------------------------------------
+    
+    # --- חידוש: קבלת שני מדדי סיכון נפרדים מהסליידרים ---
+    buy_risk = request.args.get('buy_risk', default=50, type=int) # 1-100
+    sell_risk = request.args.get('sell_risk', default=50, type=int) # 1-100
+    # ---------------------------------------------------
     
     if not open_price:
         return jsonify({"error": "Missing open_price"}), 400
@@ -95,43 +96,48 @@ def predict():
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
-    # --- חידוש: חישוב דינמי של המכפילים לפי רמת הסיכון ---
-    # ככל ש-risk_level גבוה יותר, אנחנו "מכווצים" את היעדים לכיוון מחיר הפתיחה
-    # כדי להעלות את אחוזי ההצלחה.
+    # --- חידוש: חישוב דינמי ונפרד לכל יעד ומכפיל ביטחון ---
+    # הפונקציה (0.8 עד 1.2)
+    def calculate_adjustment(risk_level):
+        return 0.8 + (risk_level / 100.0) * 0.4
     
-    # חישוב אחוז ההתאמה (מ-0.8 לאגרסיבי עד 1.2 לשמרני)
-    adjustment_factor = 0.8 + (risk_level / 100.0) * 0.4 
+    # חישוב הפקטורים הנפרדים
+    buy_adjustment = calculate_adjustment(buy_risk)
+    sell_adjustment = calculate_adjustment(sell_risk)
     
-    # עדכון שולי הרווח (Margins) באופן דינמי
-    current_buy_margin = 1.000 + (1 - adjustment_factor) * 0.05
-    current_sell_margin = 0.990 - (1 - adjustment_factor) * 0.05
+    # עדכון המרג'ינים (Margins) באופן דינמי
+    current_buy_margin = 1.000 + (1 - buy_adjustment) * 0.05
+    current_sell_margin = 0.990 - (1 - sell_adjustment) * 0.05
     
-    # עדכון מכפיל הביטחון (ככל שהסיכון גבוה יותר, הביטחון יורד מהר יותר)
-    current_confidence_multiplier = BASE_CONFIDENCE_MULTIPLIER * adjustment_factor
+    # עדכון מכפילי הביטחון הנפרדים
+    current_buy_multiplier = BASE_CONFIDENCE_MULTIPLIER * buy_adjustment
+    current_sell_multiplier = BASE_CONFIDENCE_MULTIPLIER * sell_adjustment
     # ------------------------------------------------------
 
-    # תחזיות
+    # תחזיות בסיסיות מהמודל
     pred_dip_pct = model_dip.predict(current_features)[0]
     pred_peak_pct = model_peak.predict(current_features)[0]
 
-    # שימוש במרג'ינים הדינמיים
+    # שימוש במרג'ינים הדינמיים והנפרדים
     buy_target = open_price * (1 + pred_dip_pct) * current_buy_margin
     sell_target = open_price * (1 + pred_peak_pct) * current_sell_margin
 
-    # ביטחון - שימוש במכפיל הדינמי
+    # חישוב ביטחון - שימוש במכפילים הדינמיים והנפרדים
     dip_tree_preds = np.array([tree.predict(current_features.values) for tree in model_dip.estimators_])
     peak_tree_preds = np.array([tree.predict(current_features.values) for tree in model_peak.estimators_])
     
-    buy_conf = int(np.clip(100 - (np.std(dip_tree_preds) * current_confidence_multiplier), 0, 100))
-    sell_conf = int(np.clip(100 - (np.std(peak_tree_preds) * current_confidence_multiplier), 0, 100))
+    # הביטחון מחושב באופן עצמאי לכל קלף
+    buy_conf = int(np.clip(100 - (np.std(dip_tree_preds) * current_buy_multiplier), 0, 100))
+    sell_conf = int(np.clip(100 - (np.std(peak_tree_preds) * current_sell_multiplier), 0, 100))
 
     return jsonify({
         "buy_target": round(buy_target, 2),
         "buy_confidence": buy_conf,
         "sell_target": round(sell_target, 2),
         "sell_confidence": sell_conf,
-        # מחזירים גם את רמת הסיכון שחושבה
-        "calculated_risk_factor": round(adjustment_factor, 2) 
+        # מחזירים גם את הפקטורים שחושבו
+        "calculated_buy_factor": round(buy_adjustment, 2),
+        "calculated_sell_factor": round(sell_adjustment, 2) 
     })
 
 if __name__ == '__main__':
