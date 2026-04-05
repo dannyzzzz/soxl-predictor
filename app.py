@@ -110,6 +110,10 @@ def predict():
     })
 
 if __name__ == '__main__':
-    train_model()
-    # הרצה על פורט 5000. host='0.0.0.0' מאפשר גישה מחוץ למחשב
+    train_model() # אימון לפני שהשרת עולה
     app.run(host='0.0.0.0', port=5000)
+else:
+    # פתרון לשרתים מקצועיים כמו Gunicorn
+    train_model()
+
+
