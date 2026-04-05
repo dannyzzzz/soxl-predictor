@@ -69,8 +69,8 @@ def train_model():
                 'Dist_from_MA200', 'NVDA_Chg', 'NVDA_Dist_MA20']
 
     # אימון המודלים (Random Forest)
-    model_dip = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42) # הגדלנו מעט את העצים והעומק
-    model_peak = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+    model_dip = RandomForestRegressor(n_estimators=180, max_depth=9, random_state=42)
+    model_peak = RandomForestRegressor(n_estimators=180, max_depth=9, random_state=42)
     model_dip.fit(df[features], df['Target_Dip'])
     model_peak.fit(df[features], df['Target_Peak'])
     
@@ -93,19 +93,15 @@ def predict():
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
-    # פונקציית התאמה דינמית חזקה יותר (0.6 עד 1.4)
+    # פונקציית התאמה דינמית (0.8 עד 1.2)
     def calculate_adjustment(risk_level):
-        return 0.6 + (risk_level / 100.0) * 0.8
+        return 0.8 + (risk_level / 100.0) * 0.4
     
     # חישוב הפקטורים הנפרדים
     buy_adjustment = calculate_adjustment(buy_risk)
     sell_adjustment = calculate_adjustment(sell_risk)
     
-    # --- חידוש 1: מנגנון "תיקון שמרנות" חזק (Force Dip) ---
-    # נגדיר סף מינימום לירידה (Dip) במצב אגרסיבי. למשל, לפחות 1.5% מתחת לפתיחה.
-    # זה מונע יעדים הזויים כמו "מעל מחיר הפתיחה" לקנייה.
-    
-    # תחזיות בסיסיות מהמודל
+    # --- תיקון 1: מנגנון "תיקון שמרנות" חזק (Force Dip) ---
     pred_dip_pct = model_dip.predict(current_features)[0]
     pred_peak_pct = model_peak.predict(current_features)[0]
     
@@ -119,7 +115,10 @@ def predict():
     # -----------------------------------------------
 
     # עדכון המרג'ינים (Margins) באופן דינמי
-    current_buy_margin = 1.000 + (1 - buy_adjustment) * 0.05
+    # --- תיקון 2: ביטול המרג'ין לקנייה ---
+    # אנחנו לא משתמשים במרג'ין נוסף עבור קנייה. זה מונע ביטול של תיקון השמרנות.
+    current_buy_margin = 1.000
+    # ------------------------------------
     current_sell_margin = 0.990 - (1 - sell_adjustment) * 0.05
     
     # עדכון מכפילי הביטחון הנפרדים
@@ -137,7 +136,7 @@ def predict():
     buy_conf = int(np.clip(100 - (np.std(dip_tree_preds) * current_buy_multiplier), 0, 100))
     sell_conf = int(np.clip(100 - (np.std(peak_tree_preds) * current_sell_multiplier), 0, 100))
     
-    # --- חידוש 2: מנגנון "תיקון ביטחון" דינמי ליעדים רחוקים ---
+    # --- תיקון 3 (חדש): מנגנון "תיקון ביטחון" (Penalty) ישירות ב-Backend ---
     # ככל שהיעד רחוק יותר ממחיר הפתיחה, אנחנו מורידים את הביטחון באופן מלאכותי
     
     # חישוב המרחק של יעדי הקנייה והמכירה ממחיר הפתיחה
