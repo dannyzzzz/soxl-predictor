@@ -93,9 +93,9 @@ def predict():
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
-    # פונקציית התאמה דינמית (0.8 עד 1.2)
+    # פונקציית התאמה דינמית חזקה יותר (0.6 עד 1.4)
     def calculate_adjustment(risk_level):
-        return 0.8 + (risk_level / 100.0) * 0.4
+        return 0.6 + (risk_level / 100.0) * 0.8
     
     # חישוב הפקטורים הנפרדים
     buy_adjustment = calculate_adjustment(buy_risk)
@@ -116,9 +116,7 @@ def predict():
 
     # עדכון המרג'ינים (Margins) באופן דינמי
     # --- תיקון 2: ביטול המרג'ין לקנייה ---
-    # אנחנו לא משתמשים במרג'ין נוסף עבור קנייה. זה מונע ביטול של תיקון השמרנות.
     current_buy_margin = 1.000
-    # ------------------------------------
     current_sell_margin = 0.990 - (1 - sell_adjustment) * 0.05
     
     # עדכון מכפילי הביטחון הנפרדים
@@ -129,33 +127,32 @@ def predict():
     buy_target = open_price * (1 + pred_dip_pct) * current_buy_margin
     sell_target = open_price * (1 + pred_peak_pct) * current_sell_margin
 
-    # חישוב ביטחון - שימוש במכפילים הדינמיים והנפרדים
+    # חישוב ביטחון בסיסי
     dip_tree_preds = np.array([tree.predict(current_features.values) for tree in model_dip.estimators_])
     peak_tree_preds = np.array([tree.predict(current_features.values) for tree in model_peak.estimators_])
     
     buy_conf = int(np.clip(100 - (np.std(dip_tree_preds) * current_buy_multiplier), 0, 100))
     sell_conf = int(np.clip(100 - (np.std(peak_tree_preds) * current_sell_multiplier), 0, 100))
     
-    # --- תיקון 3 (חדש): מנגנון "תיקון ביטחון" (Penalty) ישירות ב-Backend ---
-    # ככל שהיעד רחוק יותר ממחיר הפתיחה, אנחנו מורידים את הביטחון באופן מלאכותי
-    
-    # חישוב המרחק של יעדי הקנייה והמכירה ממחיר הפתיחה
-    buy_dist = abs(buy_target - open_price)
-    sell_dist = abs(sell_target - open_price)
-    
-    # נגדיר סף מרחק לביטחון גבוה (למשל, 0.8 דולר). מעליו, הביטחון יורד.
-    DISTANCE_THRESHOLD = 0.8 
-    
-    # תיקון ביטחון קנייה
-    if buy_dist > DISTANCE_THRESHOLD:
-        penalty = (buy_dist - DISTANCE_THRESHOLD) * 15 # הורדה של 15 נקודות לכל דולר מעל הסף
-        buy_conf = int(np.clip(buy_conf - penalty, 0, 100))
+    # --- תיקון 3 (חדש): מנגנון תיקון ביטחון אמיץ לקנייה ---
+    # אם המודל שמרני מדי במצב אגרסיבי, אנחנו נכריח את הביטחון לרדת
+    if buy_adjustment < 0.8: # במצב אגרסיבי במיוחד (מתחת ל-25 בסליידר)
+        # נוריד את הביטחון הגולמי באופן מלאכותי. נשתמש ב-clip כדי להבטיח שהוא ירד לאזור הגיוני.
+        buy_conf = int(np.clip(buy_conf * 0.5, 30, 70)) 
+    elif buy_adjustment < 1.0: # במצב אגרסיבי מתון
+        buy_conf = int(np.clip(buy_conf * 0.8, 50, 90))
+    # ----------------------------------------------------
         
-    # תיקון ביטחון מכירה
-    if sell_dist > DISTANCE_THRESHOLD:
-        penalty = (sell_dist - DISTANCE_THRESHOLD) * 15
-        sell_conf = int(np.clip(sell_conf - penalty, 0, 100))
-    # -----------------------------------------------
+    # --- תיקון 4 (חדש): מנגנון תיקון ביטחון למכירה (Capped Penalty) ---
+    # נרכך את הקנס על המרחק כדי שלא יאפס את הביטחון לחלוטין.
+    sell_dist = abs(sell_target - open_price)
+    DISTANCE_THRESHOLD_SELL = 0.8 
+    
+    if sell_dist > DISTANCE_THRESHOLD_SELL:
+        # קנס מרוכך בהרבה: הורדה של 10 נקודות לכל דולר מעל הסף, עם סף מינימום של 15%.
+        penalty = (sell_dist - DISTANCE_THRESHOLD_SELL) * 10
+        sell_conf = int(np.clip(sell_conf - penalty, 15, 100)) # סף מינימום 15%
+    # ----------------------------------------------------
 
     return jsonify({
         "buy_target": round(buy_target, 2),
