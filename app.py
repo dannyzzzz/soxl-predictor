@@ -13,10 +13,10 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # ⚙️ הגדרות ופרמטרים
 # ==========================================
-# הלינק הציבורי ששלחת (פורמט CSV)
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRts2FKh1u-wF8aaLuaPqn0wfRJ6EarRMoTQ3HK2_95KJtBJwxQ5WoYOql9c6jsAZ3wcqz4jNdnim6z/pub?gid=0&single=true&output=csv"
 
-CONFIDENCE_MULTIPLIER = 800
+# מכפיל ביטחון (העלינו מעט כדי להיות שמרניים יותר עם המודל החדש)
+CONFIDENCE_MULTIPLIER = 900 
 BUY_MARGIN = 1.000
 SELL_MARGIN = 0.990
 
@@ -30,23 +30,31 @@ last_features_row = None
 
 def train_model():
     global model_dip, model_peak, last_features_row
-    print("🔄 מושך נתונים מהלינק הציבורי ומאמן מודלים...")
+    print("🔄 מושך נתונים ומאמן מודלים משודרגים...")
     
-    # משיכת ה-CSV מהאינטרנט
+    # 1. משיכת ה-CSV של SOXL מהגוגל שייטס
     response = requests.get(CSV_URL)
     df = pd.read_csv(StringIO(response.text))
     
     # ניקוי והמרת נתונים
-    cols_to_convert = ['Open', 'High', 'Low', 'Close', 'VIX_Close', 'Oil_Close']
+    # ודא שהעמודה 'NVDA_Close' קיימת בגיליון!
+    cols_to_convert = ['Open', 'High', 'Low', 'Close', 'VIX_Close', 'Oil_Close', 'NVDA_Close']
     for col in cols_to_convert:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     df = df.dropna()
 
-    # הנדסת מאפיינים
+    # הנדסת מאפיינים (Features)
     df['Gap'] = (df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)
     df['Prev_Vol'] = (df['High'].shift(1) - df['Low'].shift(1)) / df['Open'].shift(1)
     df['VIX_Chg'] = df['VIX_Close'].pct_change()
     df['Oil_Chg'] = df['Oil_Close'].pct_change()
+    
+    # --- מאפיינים חדשים עבור Nvidia שהוספת לגיליון ---
+    # השרת פשוט קורא את מה שהנוסחה שלך יצרה
+    df['NVDA_Chg'] = df['NVDA_Close'].pct_change() # אחוז השינוי היומי של Nvidia
+    df['NVDA_Dist_MA20'] = (df['NVDA_Close'] - df['NVDA_Close'].rolling(20).mean()) / df['NVDA_Close'].rolling(20).mean() # מרחק NVDA מממוצע 20
+    # --------------------------------------------------
 
     delta = df['Close'].diff()
     gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
@@ -57,23 +65,29 @@ def train_model():
         df[f'MA_{ma}'] = df['Close'].rolling(window=ma).mean()
         df[f'Dist_from_MA{ma}'] = (df['Close'] - df[f'MA_{ma}']) / df[f'MA_{ma}']
 
-    df['MA20_Slope'] = (df['MA_20'] - df['MA_20'].shift(3)) / df['MA_20'].shift(3)
     df['Target_Dip'] = (df['Low'] - df['Open']) / df['Open']
     df['Target_Peak'] = (df['High'] - df['Open']) / df['Open']
+    
+    # ניקוי סופי לפני אימון (בגלל ה-shift וה-pct_change החדשים)
     df = df.dropna()
 
+    # --- עדכון רשימת המאפיינים (Features) לאימון ---
+    # הוספנו את המאפיינים החדשים של Nvidia לרשימה שהמודל לומד
     features = ['Open', 'Gap', 'Prev_Vol', 'VIX_Chg', 'Oil_Chg', 'RSI_14', 
-                'Dist_from_MA20', 'MA20_Slope', 'Dist_from_MA50', 'Dist_from_MA100', 
-                'Dist_from_MA150', 'Dist_from_MA200']
+                'Dist_from_MA20', 'Dist_from_MA50', 'Dist_from_MA100', 
+                'Dist_from_MA200',
+                # מאפייני Nvidia החדשים:
+                'NVDA_Chg', 'NVDA_Dist_MA20']
+    # --------------------------------------------------
 
-    # אימון המודלים
-    model_dip = RandomForestRegressor(n_estimators=150, max_depth=8, random_state=42)
-    model_peak = RandomForestRegressor(n_estimators=150, max_depth=8, random_state=42)
+    # אימון המודלים (Random Forest)
+    model_dip = RandomForestRegressor(n_estimators=180, max_depth=9, random_state=42)
+    model_peak = RandomForestRegressor(n_estimators=180, max_depth=9, random_state=42)
     model_dip.fit(df[features], df['Target_Dip'])
     model_peak.fit(df[features], df['Target_Peak'])
     
     last_features_row = df[features].iloc[-1:].copy()
-    print("✅ המודלים אומנו בהצלחה!")
+    print("✅ המודלים שודרגו ואומנו בהצלחה עם נתוני Nvidia מהגיליון!")
 
 @app.route('/predict', methods=['GET'])
 def predict():
@@ -110,10 +124,8 @@ def predict():
     })
 
 if __name__ == '__main__':
-    train_model() # אימון לפני שהשרת עולה
+    train_model() 
     app.run(host='0.0.0.0', port=5000)
 else:
-    # פתרון לשרתים מקצועיים כמו Gunicorn
+    # פתרון עבור Gunicorn (Render)
     train_model()
-
-
