@@ -93,9 +93,9 @@ def predict():
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
-    # פונקציית התאמה דינמית (0.7 עד 1.3)
+    # פונקציית התאמה דינמית חזקה יותר (0.6 עד 1.4)
     def calculate_adjustment(risk_level):
-        return 0.7 + (risk_level / 100.0) * 0.6
+        return 0.6 + (risk_level / 100.0) * 0.8
     
     # חישוב הפקטורים הנפרדים
     buy_adjustment = calculate_adjustment(buy_risk)
