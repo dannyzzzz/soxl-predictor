@@ -14,11 +14,11 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # ⚙️ קונפיגורציה ופרמטרים קבועים
 # ==========================================
-# ה-URL הציבורי של הגוגל שיטס שלך המיוצא כ-CSV.
+# ה-URL הציבורי של הגוגל שיטס המיוצא כ-CSV (SOXL).
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRts2FKh1u-wF8aaLuaPqn0wfRJ6EarRMoTQ3HK2_95KJtBJwxQ5WoYOql9c6jsAZ3wcqz4jNdnim6z/pub?gid=0&single=true&output=csv"
 
 # פרמטרים לכיוונון מודל הביטחון (Confidence)
-BASE_CONFIDENCE_MULTIPLIER = 1000 # עלינו מעט כדי להיות שמרניים יותר במדדים
+BASE_CONFIDENCE_MULTIPLIER = 1000 # שמרני יותר במדדים
 DISTANCE_PENALTY_FACTOR = 1.5 
 
 app = Flask(__name__)
@@ -49,6 +49,7 @@ def train_model():
 
     # 2. ניקוי ועיבוד נתונים בסיסי
     try:
+        # המרת עמודות למספרים
         cols_to_convert = ['Open', 'High', 'Low', 'Close', 'VIX_Close', 'Oil_Close', 'NVDA_Close']
         for col in cols_to_convert:
             if col in df.columns:
@@ -63,32 +64,36 @@ def train_model():
         df['NVDA_Chg'] = df['NVDA_Close'].pct_change() 
         df['NVDA_Dist_MA20'] = (df['NVDA_Close'] - df['NVDA_Close'].rolling(20).mean()) / df['NVDA_Close'].rolling(20).mean()
 
+        # RSI בסיסי
         delta = df['Close'].diff()
         gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
         rs = gain.ewm(com=13, min_periods=14).mean() / loss.ewm(com=13, min_periods=14).mean()
         df['RSI_14'] = 100 - (100 / (1 + rs))
 
+        # ממוצעים נעים (MAs)
         for ma in [20, 50, 100, 200]:
             df[f'MA_{ma}'] = df['Close'].rolling(window=ma).mean()
             df[f'Dist_from_MA{ma}'] = (df['Close'] - df[f'MA_{ma}']) / df[f'MA_{ma}']
 
+        # הגדרת המטרות לחיזוי (Targets)
         df['Target_Dip'] = (df['Low'] - df['Open']) / df['Open']
         df['Target_Peak'] = (df['High'] - df['Open']) / df['Open']
         df = df.dropna()
 
+        # בחירת המאפיינים למודל (Features)
         features = ['Open', 'Gap', 'Prev_Vol', 'VIX_Chg', 'Oil_Chg', 'RSI_14', 
                     'Dist_from_MA20', 'Dist_from_MA50', 'Dist_from_MA100', 'Dist_from_MA200',
                     'NVDA_Chg', 'NVDA_Dist_MA20']
 
         # 4. אימון המודלים (Random Forest Regressor)
         print("🤖 מאמן מודלי Random Forest...")
-        # נשתמש ב max_depth גבוה יותר (12) כדי לתפוס יותר תנודתיות
         model_dip = RandomForestRegressor(n_estimators=150, max_depth=12, random_state=42)
         model_peak = RandomForestRegressor(n_estimators=150, max_depth=12, random_state=42)
         
         model_dip.fit(df[features], df['Target_Dip'])
         model_peak.fit(df[features], df['Target_Peak'])
         
+        # שמירת השורה האחרונה לצורך פיצ'רים של ה-Lag בחיזוי
         last_features_row = df[features].iloc[-1:].copy()
         print("✅ אימון המודל הושלם בהצלחה.")
     except Exception as e:
@@ -103,23 +108,25 @@ def predict():
     if model_dip is None:
         return jsonify({"error": "Model not trained yet"}), 500
     
+    # משיכת פרמטרים מה-URL
     open_price = request.args.get('open_price', type=float)
+    # ברירת מחדל לסליידרים היא 50 (ניטרלי)
     buy_shaper = request.args.get('buy_shaper', default=50, type=int) 
     sell_shaper = request.args.get('sell_shaper', default=50, type=int) 
     
     if not open_price:
         return jsonify({"error": "Missing open_price"}), 400
 
+    # עדכון שורת הפיצ'רים עם מחיר הפתיחה שהוזן
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
     # ---------------------------------------------------------
-    # 🧠 לוגיקת חישוב דינמית - פתרון השמרנות הקיצונית
+    # 🧠 לוגיקת חישוב דינמית - כולל התיקון הקריטי
     # ---------------------------------------------------------
 
-    # 1. !!! חידוש 1 !!! טווח פקטורים אגרסיבי הרבה יותר (0.3 עד 1.8)
-    # 1 (אגרסיבי במיוחד) -> 0.3, 100 (שמרני במיוחד) -> 1.8
-    # זה יגרום לשינויים דרסטיים ביעדים.
+    # 1. טווח פקטורים אגרסיבי (0.3 עד 1.8)
+    # 1 (אגרסיבי) -> 0.3, 100 (שמרני) -> 1.8
     def calculate_adjustment_factor(slider_val):
         return 0.3 + (slider_val / 100.0) * 1.5
 
@@ -131,28 +138,34 @@ def predict():
     pred_peak_pct = model_peak.predict(current_features)[0] 
 
     # --- !!! חידוש 2 !!! מנגנון Force Dip (סף מינימום) ---
-    # אם המודל שמרני מדי במצב אגרסיבי, אנחנו נכריח אותו לרדת לפחות ב-1.5% מהפתיחה.
-    # זה מונע יעדים כמו "מעל מחיר הפתיחה" לקנייה.
+    # נגדיר סף ירידה מינימלי למצב אגרסיבי (1.5% מתחת לפתיחה).
     MIN_DIP_PCT = -0.015 
-    if buy_adjustment < 1.0: # מצב אגרסיבי
+    
+    # !!! התיקון הקריטי כאן בשורה 137 !!!
+    # משתמשים ב-buy_safe_factor (שהוגדר למעלה) במקום buy_adjustment.
+    if buy_safe_factor < 1.0: # מצב אגרסיבי
         # נשנה את החיזוי הגולמי כך שיבטיח ירידה אמיתית
         pred_dip_pct = pred_dip_pct * 0.5 + MIN_DIP_PCT * 0.5 
     # ---------------------------------------------------
 
     # 3. חישוב יעדי המחיר הסופיים (Price Targets)
+    # בקנייה: ככל ש buy_safe_factor נמוך (אגרסיבי), המחיר יורד דרסטית.
     buy_target = open_price * (1 + (pred_dip_pct / buy_safe_factor))
     sell_target = open_price * (1 + (pred_peak_pct / sell_safe_factor))
 
-    # 4. חישוב רמות ביטחון דינמיות (Confidence)
+    # 4. חישוב רמות ביטחון דינמיות (Confidence) - עם קנס מרחק
+    # א. חישוב שונות התחזיות בין כל העצים בפורסט (סטיית תקן)
     dip_tree_preds = np.array([tree.predict(current_features.values) for tree in model_dip.estimators_])
     peak_tree_preds = np.array([tree.predict(current_features.values) for tree in model_peak.estimators_])
     dip_std = np.std(dip_tree_preds)
     peak_std = np.std(peak_tree_preds)
 
+    # ב. חישוב "קנס" על מרחק היעד ממחיר הפתיחה
+    # ככל שהיעד רחוק יותר, המודל פחות בטוח.
     buy_dist_penalty = abs(buy_target - open_price) / open_price
     sell_dist_penalty = abs(sell_target - open_price) / open_price
 
-    # אנו משתמשים במכפילים וקנסות מתונים יותר כדי למנוע 0%.
+    # Multiplier on STD (Inverse of safety factor)
     buy_risk_mult = BASE_CONFIDENCE_MULTIPLIER / buy_safe_factor
     sell_risk_mult = BASE_CONFIDENCE_MULTIPLIER / sell_safe_factor
 
@@ -163,6 +176,7 @@ def predict():
     buy_confidence = int(np.clip(buy_conf_raw, 1, 99)) # מונע 0% או 100% מוחלטים
     sell_confidence = int(np.clip(sell_conf_raw, 1, 99))
 
+    # החזרת התוצאות כ-JSON
     return jsonify({
         "buy_target": round(buy_target, 2),
         "buy_confidence": buy_confidence,
