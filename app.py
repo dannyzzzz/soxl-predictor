@@ -6,9 +6,9 @@ from flask_cors import CORS
 import warnings
 import requests
 from io import StringIO
-import tracebck # נחוץ כדי להדפיס שגיאות מלאות ללוג
+import traceback  # <--- התיקון הקריטי כאן: הוספנו את האות a
 
-# הסתרת אזהרות מעצבנות
+# ביטול אזהרות מעצבנות
 warnings.filterwarnings('ignore')
 
 # ==========================================
@@ -16,6 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # ה-URL הציבורי של הגוגל שיטס שלך המיוצא כ-CSV.
 # וודא שהלינק הזה פתוח לציבור: File -> Share -> Publish to web -> .csv
+# דוגמה לפורמט: https://docs.google.com/spreadsheets/d/e/XXXX/pub?gid=0&single=true&output=csv
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRts2FKh1u-wF8aaLuaPqn0wfRJ6EarRMoTQ3HK2_95KJtBJwxQ5WoYOql9c6jsAZ3wcqz4jNdnim6z/pub?gid=0&single=true&output=csv"
 
 # פרמטרים לכיוונון מודל הביטחון (Confidence)
@@ -25,7 +26,7 @@ BASE_CONFIDENCE_MULTIPLIER = 800  # כיוונון עדין למניעת 0% קב
 DISTANCE_PENALTY_FACTOR = 1.5      # "קנס" מתון יותר על מרחק
 
 app = Flask(__name__)
-CORS(app) # מאפשר לפורטנד (Lovable) לתקשר עם הבקאנד
+CORS(app)  # מאפשר לפורטנד (Lovable) לתקשר עם הבקאנד
 
 # משתנים גלובליים להחזקת המודלים והנתונים האחרונים
 model_dip = None
@@ -42,12 +43,12 @@ def train_model():
     # 1. משיכת הנתונים בזמן אמת מהגוגל שיטס
     try:
         response = requests.get(CSV_URL)
-        response.raise_for_status() # בדיקה שהמשיכה הצליחה
+        response.raise_for_status()  # בדיקה שהמשיכה הצליחה
         df = pd.read_csv(StringIO(response.text))
         print("✅ הנתונים נמשכו בהצלחה מהשיט.")
     except Exception as e:
         print(f"❌ שגיאה במשיכת הנתונים: {e}")
-        traceback.print_exc() # הדפסת השגיאה המלאה ללוג של Render
+        traceback.print_exc()  # הדפסת השגיאה המלאה ללוג של Render
         return
 
     # 2. ניקוי ועיבוד נתונים בסיסי
@@ -108,7 +109,7 @@ def train_model():
         model_dip.fit(df[features], df['Target_Dip'])
         model_peak.fit(df[features], df['Target_Peak'])
         
-        # שמירת השורה האחרונה
+        # שמירת השורה האחרונה לצורך ה-Lag בחיזוי
         last_features_row = df[features].iloc[-1:].copy()
         print("✅ אימון המודל הושלם בהצלחה.")
     except Exception as e:
@@ -125,7 +126,7 @@ def predict():
     
     # משיכת פרמטרים מה-URL
     open_price = request.args.get('open_price', type=float)
-    # ברירת מחדל לסליידרים היא 50
+    # ברירת מחדל לסליידרים היא 50 (ניטרלי)
     buy_shaper = request.args.get('buy_shaper', default=50, type=int) 
     sell_shaper = request.args.get('sell_shaper', default=50, type=int) 
     
@@ -140,7 +141,8 @@ def predict():
     # 🧠 לוגיקת חישוב דינמית - כולל כל התיקונים הלוגיים
     # ---------------------------------------------------------
 
-    # 1. יצירת פקטורים לנרמול הסליידרים (0.7 עד 1.3 - הגדלנו את הטווח)
+    # 1. יצירת פקטורים לנרמול הסליידרים (0.7 עד 1.3 - טווח רחב לתגובתיות)
+    # 1 (אגרסיבי) -> 0.7, 100 (שמרני) -> 1.3
     def calculate_adjustment_factor(slider_val):
         return 0.7 + (slider_val / 100.0) * 0.6
 
@@ -148,29 +150,33 @@ def predict():
     sell_safe_factor = calculate_adjustment_factor(sell_shaper)
 
     # 2. ביצוע החיזוי הבסיסי (Raw Prediction) מהמודל
-    pred_dip_pct = model_dip.predict(current_features)[0] 
-    pred_peak_pct = model_peak.predict(current_features)[0] 
+    pred_dip_pct = model_dip.predict(current_features)[0] # שלילי
+    pred_peak_pct = model_peak.predict(current_features)[0] # חיובי
 
     # 3. חישוב יעדי המחיר הסופיים (Price Targets) - כולל תיקון הלוגיקה ההפוכה
-    # קנייה: שמרני -> מחלק ב SafeFactor -> יעד גבוה יותר (פחות ירידה).
+    # קנייה (Dip): שמרני -> מחלק ב SafeFactor גבוה -> יעד גבוה יותר (קרוב לפתיחה, פחות ירידה).
     buy_target = open_price * (1 + (pred_dip_pct / buy_safe_factor))
     
-    # מכיָרה: שמרני -> מחלק ב SafeFactor -> יעד נמוך יותר (הבטחת רווח). !!! תיקון !!!
+    # מכיָרה (Peak): !!! תיקון !!!
+    # שמרני -> מחלק ב SafeFactor גבוה -> יעד *נמוך יותר* (קרוב לפתיחה, הבטחת רווח).
     sell_target = open_price * (1 + (pred_peak_pct / sell_safe_factor))
 
     # 4. חישוב רמות ביטחון דינמיות (Confidence) - פתרון בעיית ה-0% וההיפוך
-    # א. חישוב שונות התחזיות בין כל העצים
+    # א. חישוב שונות התחזיות בין כל העצים בפורסט (סטיית תקן)
     dip_tree_preds = np.array([tree.predict(current_features.values) for tree in model_dip.estimators_])
     peak_tree_preds = np.array([tree.predict(current_features.values) for tree in model_peak.estimators_])
     dip_std = np.std(dip_tree_preds)
     peak_std = np.std(peak_tree_preds)
 
     # ב. חישוב "קנס" על מרחק היעד ממחיר הפתיחה
+    # ככל שהיעד רחוק יותר, המודל פחות בטוח.
     buy_dist_penalty = abs(buy_target - open_price) / open_price
     sell_dist_penalty = abs(sell_target - open_price) / open_price
 
     # ג. שילוב המדדים הסופי (Confidence logic)
-    # אנו משתמשים במכפילים וקנסות מתונים יותר כדי למנוע 0%.
+    # אנו משתמשים במכפילים וקנסות מתונים יותר כדי למנוע נפילה ל-0%.
+    
+    # Multiplier on STD (Inverse of safety factor: Aggressive=High Multiplier -> Lower Conf)
     buy_risk_mult = BASE_CONFIDENCE_MULTIPLIER / buy_safe_factor
     sell_risk_mult = BASE_CONFIDENCE_MULTIPLIER / sell_safe_factor
 
@@ -181,6 +187,7 @@ def predict():
     buy_confidence = int(np.clip(buy_conf_raw, 1, 99)) # מונע 0% או 100% מוחלטים
     sell_confidence = int(np.clip(sell_conf_raw, 1, 99))
 
+    # החזרת התוצאות כ-JSON
     return jsonify({
         "buy_target": round(buy_target, 2),
         "buy_confidence": buy_confidence,
@@ -194,7 +201,10 @@ def predict():
 # 🏁 הרצת האפליקציה
 # ==========================================
 if __name__ == '__main__':
+    # אימון ראשוני בעת ההפעלה (לסביבה מקומית)
     train_model() 
+    # הרצה על פורט 5000
     app.run(host='0.0.0.0', port=5000)
 else:
+    # אימון בעת ההפעלה על ידי Gunicorn (ל-Render)
     train_model()
