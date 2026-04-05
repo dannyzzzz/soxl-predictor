@@ -93,31 +93,34 @@ def predict():
     current_features = last_features_row.copy()
     current_features['Open'] = open_price
 
-    # פונקציית התאמה דינמית חזקה יותר (0.6 עד 1.4)
+    # פונקציית התאמה דינמית (0.8 עד 1.2)
     def calculate_adjustment(risk_level):
-        return 0.6 + (risk_level / 100.0) * 0.8
+        return 0.8 + (risk_level / 100.0) * 0.4
     
     # חישוב הפקטורים הנפרדים
     buy_adjustment = calculate_adjustment(buy_risk)
     sell_adjustment = calculate_adjustment(sell_risk)
     
-    # --- תיקון 1: מנגנון "תיקון שמרנות" חזק (Force Dip) ---
+    # --- תיקון שמרנות (כבר עשינו) ---
     pred_dip_pct = model_dip.predict(current_features)[0]
     pred_peak_pct = model_peak.predict(current_features)[0]
     
-    # הגדרת סף מינימום ל-Dip (למשל, 1.5% מתחת לפתיחה)
     MIN_DIP_PCT = -0.015 
-    
-    # תיקון יעדי הקנייה במצב אגרסיבי
-    if buy_adjustment < 1.0: # אנחנו במצב אגרסיבי
-        # נשנה את החיזוי הגולמי כך שיבטיח ירידה אמיתית
+    if buy_adjustment < 1.0: # מצב אגרסיבי
         pred_dip_pct = pred_dip_pct * 0.5 + MIN_DIP_PCT * 0.5 
-    # -----------------------------------------------
+    # -------------------------------
 
-    # עדכון המרג'ינים (Margins) באופן דינמי
-    # --- תיקון 2: ביטול המרג'ין לקנייה ---
+    # --- תיקון 1 (חדש): היפוך לוגיקת המרג'ין למכירה ---
+    # נגדיר מרג'ין בסיסי של 0.990 (שמרני). 
+    # במצב אגרסיבי (sell_adjustment נמוך), נוריד את המרג'ין כדי להגדיל את היעד.
+    # במצב שמרני (sell_adjustment גבוה), נשמור על המרג'ין הגבוה כדי "לכווץ" את היעד.
+    current_sell_margin = 0.990 + (sell_adjustment - 1.0) * 0.05 
+    # ככה כש sell_adjustment = 1.2 (שמרני), המרג'ין יהיה 1.000.
+    # כש sell_adjustment = 0.8 (אגרסיבי), המרג'ין יהיה 0.980.
+    
+    # המרג'ין של הקנייה נשאר 1.000 (ביטלנו אותו).
     current_buy_margin = 1.000
-    current_sell_margin = 0.990 - (1 - sell_adjustment) * 0.05
+    # ----------------------------------------------------
     
     # עדכון מכפילי הביטחון הנפרדים
     current_buy_multiplier = BASE_CONFIDENCE_MULTIPLIER * buy_adjustment
@@ -127,28 +130,25 @@ def predict():
     buy_target = open_price * (1 + pred_dip_pct) * current_buy_margin
     sell_target = open_price * (1 + pred_peak_pct) * current_sell_margin
 
-    # חישוב ביטחון בסיסי
+    # חישוב ביטחון - שימוש במכפילים הדינמיים והנפרדים
     dip_tree_preds = np.array([tree.predict(current_features.values) for tree in model_dip.estimators_])
     peak_tree_preds = np.array([tree.predict(current_features.values) for tree in model_peak.estimators_])
     
     buy_conf = int(np.clip(100 - (np.std(dip_tree_preds) * current_buy_multiplier), 0, 100))
     sell_conf = int(np.clip(100 - (np.std(peak_tree_preds) * current_sell_multiplier), 0, 100))
     
-    # --- תיקון 3 (חדש): מנגנון תיקון ביטחון אמיץ לקנייה ---
-    # אם המודל שמרני מדי במצב אגרסיבי, אנחנו נכריח את הביטחון לרדת
-    if buy_adjustment < 0.8: # במצב אגרסיבי במיוחד (מתחת ל-25 בסליידר)
-        # נוריד את הביטחון הגולמי באופן מלאכותי. נשתמש ב-clip כדי להבטיח שהוא ירד לאזור הגיוני.
-        buy_conf = int(np.clip(buy_conf * 0.5, 30, 70)) 
-    elif buy_adjustment < 1.0: # במצב אגרסיבי מתון
-        buy_conf = int(np.clip(buy_conf * 0.8, 50, 90))
-    # ----------------------------------------------------
-        
-    # --- תיקון 4 (חדש): מנגנון תיקון ביטחון למכירה (Capped Penalty) ---
-    # נרכך את הקנס על המרחק כדי שלא יאפס את הביטחון לחלוטין.
+    # --- תיקון 2 (חדש): ביטול קנס המרחק למכירה שמרנית ---
+    # אנחנו לא רוצים לתת קנס על מרחק ליעדים שהם שמרניים (כמו ה-$59.05).
+    # נגדיר סף מרחק לביטחון גבוה רק ליעדים שהם באמת אגרסיביים.
     sell_dist = abs(sell_target - open_price)
+    # נשתמש ב open_price * (1 + pred_peak_pct) כדי למדוד את המרחק הגולמי
+    raw_sell_target = open_price * (1 + pred_peak_pct)
+    raw_sell_dist = abs(raw_sell_target - open_price)
+    
     DISTANCE_THRESHOLD_SELL = 0.8 
     
-    if sell_dist > DISTANCE_THRESHOLD_SELL:
+    # רק אם המרחק הגולמי (של המודל) הוא אגרסיבי, ניתן קנס.
+    if sell_adjustment < 1.0 and raw_sell_dist > DISTANCE_THRESHOLD_SELL:
         # קנס מרוכך בהרבה: הורדה של 10 נקודות לכל דולר מעל הסף, עם סף מינימום של 15%.
         penalty = (sell_dist - DISTANCE_THRESHOLD_SELL) * 10
         sell_conf = int(np.clip(sell_conf - penalty, 15, 100)) # סף מינימום 15%
