@@ -8,13 +8,14 @@ import requests
 from io import StringIO
 import traceback
 
-# הסתרת אזהרות מעצבנות
+# הסתרת אזהרות
 warnings.filterwarnings('ignore')
 
 # ==========================================
 # ⚙️ קונפיגורציה ופרמטרים קבועים
 # ==========================================
 # ה-URL הציבורי של הגוגל שיטס המיוצא כ-CSV (SOXL).
+# וודא שהשיט כולל עמודות: NDX_Close, SPX_Close.
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRts2FKh1u-wF8aaLuaPqn0wfRJ6EarRMoTQ3HK2_95KJtBJwxQ5WoYOql9c6jsAZ3wcqz4jNdnim6z/pub?gid=0&single=true&output=csv"
 
 # פרמטרים לכיוונון מודל הביטחון (Confidence)
@@ -49,20 +50,40 @@ def train_model():
 
     # 2. ניקוי ועיבוד נתונים בסיסי
     try:
-        # המרת עמודות למספרים
-        cols_to_convert = ['Open', 'High', 'Low', 'Close', 'VIX_Close', 'Oil_Close', 'NVDA_Close']
+        # המרת עמודות למספרים. הוספנו את המדדים הראשיים.
+        cols_to_convert = ['Open', 'High', 'Low', 'Close', 'VIX_Close', 'Oil_Close', 'NVDA_Close', 'NDX_Close', 'SPX_Close']
         for col in cols_to_convert:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df.dropna()
+        print(f"✅ נתונים נוקו. מספר שורות: {len(df)}")
 
         # 3. הנדסת מאפיינים (Feature Engineering)
+        print("🧠 מחשב אינדיקטורים טכניים...")
         df['Gap'] = (df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)
         df['Prev_Vol'] = (df['High'].shift(1) - df['Low'].shift(1)) / df['Open'].shift(1)
         df['VIX_Chg'] = df['VIX_Close'].pct_change()
         df['Oil_Chg'] = df['Oil_Close'].pct_change()
+        
+        # אינדיקטורים למניות מתואמות (NVDA)
         df['NVDA_Chg'] = df['NVDA_Close'].pct_change() 
         df['NVDA_Dist_MA20'] = (df['NVDA_Close'] - df['NVDA_Close'].rolling(20).mean()) / df['NVDA_Close'].rolling(20).mean()
+
+        # --- !!! חידוש 1 !!! הוספת אינדיקטורים למדדים ראשיים ---
+        if 'NDX_Close' in df.columns:
+            df['NDX_Chg'] = df['NDX_Close'].pct_change()
+            df['NDX_Dist_MA20'] = (df['NDX_Close'] - df['NDX_Close'].rolling(20).mean()) / df['NDX_Close'].rolling(20).mean()
+        else:
+            print("⚠️ עמודת NDX_Close חסרה בשיט. המאפיינים לא חושבו.")
+            df['NDX_Chg'] = 0; df['NDX_Dist_MA20'] = 0
+
+        if 'SPX_Close' in df.columns:
+            df['SPX_Chg'] = df['SPX_Close'].pct_change()
+            df['SPX_Dist_MA20'] = (df['SPX_Close'] - df['SPX_Close'].rolling(20).mean()) / df['SPX_Close'].rolling(20).mean()
+        else:
+            print("⚠️ עמודת SPX_Close חסרה בשיט. המאפיינים לא חושבו.")
+            df['SPX_Chg'] = 0; df['SPX_Dist_MA20'] = 0
+        # ----------------------------------------------------
 
         # RSI בסיסי
         delta = df['Close'].diff()
@@ -80,21 +101,23 @@ def train_model():
         df['Target_Peak'] = (df['High'] - df['Open']) / df['Open']
         df = df.dropna()
 
-        # בחירת המאפיינים למודל (Features)
+        # בחירת המאפיינים למודל (Features). הוספנו את ה-Features החדשים.
         features = ['Open', 'Gap', 'Prev_Vol', 'VIX_Chg', 'Oil_Chg', 'RSI_14', 
                     'Dist_from_MA20', 'Dist_from_MA50', 'Dist_from_MA100', 'Dist_from_MA200',
-                    'NVDA_Chg', 'NVDA_Dist_MA20']
+                    'NVDA_Chg', 'NVDA_Dist_MA20', 'NDX_Chg', 'NDX_Dist_MA20', 'SPX_Chg', 'SPX_Dist_MA20']
 
         # 4. אימון המודלים (Random Forest Regressor)
         print("🤖 מאמן מודלי Random Forest...")
         model_dip = RandomForestRegressor(n_estimators=150, max_depth=12, random_state=42)
         model_peak = RandomForestRegressor(n_estimators=150, max_depth=12, random_state=42)
         
-        model_dip.fit(df[features], df['Target_Dip'])
-        model_peak.fit(df[features], df['Target_Peak'])
+        # בדיקה שכל הפיצ'רים קיימים ב-dataframe לפני האימון
+        available_features = [f for f in features if f in df.columns]
+        model_dip.fit(df[available_features], df['Target_Dip'])
+        model_peak.fit(df[available_features], df['Target_Peak'])
         
         # שמירת השורה האחרונה לצורך פיצ'רים של ה-Lag בחיזוי
-        last_features_row = df[features].iloc[-1:].copy()
+        last_features_row = df[available_features].iloc[-1:].copy()
         print("✅ אימון המודל הושלם בהצלחה.")
     except Exception as e:
         print(f"❌ שגיאה באימון המודל או בעיבוד הנתונים: {e}")
@@ -122,11 +145,10 @@ def predict():
     current_features['Open'] = open_price
 
     # ---------------------------------------------------------
-    # 🧠 לוגיקת חישוב דינמית - כולל התיקון הקריטי
+    # 🧠 לוגיקת חישוב דינמית
     # ---------------------------------------------------------
 
     # 1. טווח פקטורים אגרסיבי (0.3 עד 1.8)
-    # 1 (אגרסיבי) -> 0.3, 100 (שמרני) -> 1.8
     def calculate_adjustment_factor(slider_val):
         return 0.3 + (slider_val / 100.0) * 1.5
 
@@ -137,19 +159,15 @@ def predict():
     pred_dip_pct = model_dip.predict(current_features)[0] 
     pred_peak_pct = model_peak.predict(current_features)[0] 
 
-    # --- !!! חידוש 2 !!! מנגנון Force Dip (סף מינימום) ---
+    # --- מנגנון Force Dip (סף מינימום) ---
     # נגדיר סף ירידה מינימלי למצב אגרסיבי (1.5% מתחת לפתיחה).
     MIN_DIP_PCT = -0.015 
-    
-    # !!! התיקון הקריטי כאן בשורה 137 !!!
-    # משתמשים ב-buy_safe_factor (שהוגדר למעלה) במקום buy_adjustment.
     if buy_safe_factor < 1.0: # מצב אגרסיבי
         # נשנה את החיזוי הגולמי כך שיבטיח ירידה אמיתית
         pred_dip_pct = pred_dip_pct * 0.5 + MIN_DIP_PCT * 0.5 
     # ---------------------------------------------------
 
     # 3. חישוב יעדי המחיר הסופיים (Price Targets)
-    # בקנייה: ככל ש buy_safe_factor נמוך (אגרסיבי), המחיר יורד דרסטית.
     buy_target = open_price * (1 + (pred_dip_pct / buy_safe_factor))
     sell_target = open_price * (1 + (pred_peak_pct / sell_safe_factor))
 
@@ -161,7 +179,6 @@ def predict():
     peak_std = np.std(peak_tree_preds)
 
     # ב. חישוב "קנס" על מרחק היעד ממחיר הפתיחה
-    # ככל שהיעד רחוק יותר, המודל פחות בטוח.
     buy_dist_penalty = abs(buy_target - open_price) / open_price
     sell_dist_penalty = abs(sell_target - open_price) / open_price
 
